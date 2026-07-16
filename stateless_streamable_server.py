@@ -7,7 +7,6 @@ Based on the official MCP SDK example for stateless HTTP transport
 import asyncio
 import logging
 import os
-import json
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -30,6 +29,7 @@ from mcp.types import (
 
 # Import our existing Google Chat tools
 from src.google_chat_mcp.auth.google_auth import GoogleChatAuth
+from src.google_chat_mcp.content import to_content_blocks
 from src.google_chat_mcp.tools import (
     MessageTools,
     SpaceTools,
@@ -75,7 +75,10 @@ class GoogleChatMCPApplication:
         try:
             # Initialize authentication
             self.auth = GoogleChatAuth(
-                service_account_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                service_account_path=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+                client_id=os.getenv("GOOGLE_CLIENT_ID"),
+                client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+                refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
             )
             await self.auth.initialize()
             
@@ -144,16 +147,10 @@ class GoogleChatMCPApplication:
                     logger.error(error_msg)
                     return [TextContent(type="text", text=error_msg)]
                 
-                # Convert result to TextContent
-                if isinstance(result, str):
-                    text = result
-                elif isinstance(result, dict):
-                    text = json.dumps(result, indent=2)
-                else:
-                    text = str(result)
-                
+                # download_attachment and friends may return inline binary data;
+                # to_content_blocks turns that into image / embedded-resource blocks.
                 logger.debug(f"Tool {tool_name} executed successfully")
-                return [TextContent(type="text", text=text)]
+                return to_content_blocks(result)
                     
             except Exception as e:
                 error_msg = f"Error executing tool {tool_name}: {str(e)}"

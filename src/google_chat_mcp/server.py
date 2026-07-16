@@ -27,6 +27,7 @@ from mcp.types import (
 from pydantic import BaseModel
 
 from .auth.google_auth import GoogleChatAuth
+from .content import to_content_blocks
 from .tools import (
     MessageTools,
     SpaceTools,
@@ -130,14 +131,9 @@ class GoogleChatMCPServer:
                 else:
                     raise ValueError(f"Unknown tool: {tool_name}")
                 
-                # Convert result to TextContent
-                if isinstance(result, str):
-                    return [TextContent(type="text", text=result)]
-                elif isinstance(result, dict):
-                    import json
-                    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-                else:
-                    return [TextContent(type="text", text=str(result))]
+                # download_attachment and friends may return inline binary data;
+                # to_content_blocks turns that into image / embedded-resource blocks.
+                return to_content_blocks(result)
                     
             except Exception as e:
                 logger.error(f"Error executing tool {tool_name}: {e}")
