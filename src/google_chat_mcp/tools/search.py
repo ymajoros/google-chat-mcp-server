@@ -161,79 +161,115 @@ class SearchTools(BaseTool):
         else:
             raise ValueError(f"Unknown search tool: {tool_name}")
     
+    # Bounds for the client-side message scan (Google Chat REST has no real
+    # full-text search on Business Starter, so we page through history and
+    # filter locally). These keep latency/quota sane on large histories.
+    _MAX_PAGES_PER_SPACE = 25      # 25 * 100 = up to 2500 messages per space
+    _MAX_MESSAGES_SCANNED = 20000  # global ceiling across all spaces
+
+    @staticmethod
+    def _message_matches(text: str, tokens: List[str]) -> bool:
+        """True when every whitespace-separated query token is in the text."""
+        lowered = text.lower()
+        return all(tok in lowered for tok in tokens)
+
+    def _list_all_spaces(self, service) -> List[Dict[str, Any]]:
+        """Page through every accessible space (spaces.list has a nextPageToken)."""
+        spaces: List[Dict[str, Any]] = []
+        page_token = None
+        while True:
+            result = service.spaces().list(
+                pageSize=100, pageToken=page_token
+            ).execute()
+            spaces.extend(result.get("spaces", []))
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                return spaces
+
+    def _scan_space_messages(self, service, space_name, tokens, limit, scanned_budget):
+        """Page through one space's messages, collecting matches. Returns (matches, scanned)."""
+        matches: List[Dict[str, Any]] = []
+        scanned = 0
+        page_token = None
+        for _ in range(self._MAX_PAGES_PER_SPACE):
+            if scanned >= scanned_budget:
+                break
+            result = service.spaces().messages().list(
+                parent=space_name,
+                pageSize=100,
+                pageToken=page_token,
+                orderBy="create_time desc",
+            ).execute()
+            for msg in result.get("messages", []):
+                scanned += 1
+                text = msg.get("text") or msg.get("argumentText") or ""
+                if text and self._message_matches(text, tokens):
+                    matches.append(msg)
+                    if len(matches) >= limit:
+                        return matches, scanned
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        return matches, scanned
+
     async def search_messages(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Search for messages using Google Chat's search capabilities."""
+        """Search messages by content across history.
+
+        Note: Google Chat REST exposes no server-side full-text search on
+        Business Starter, so this pages through message history and filters
+        locally. All whitespace-separated tokens in `query` must be present
+        (case-insensitive, AND semantics).
+        """
         try:
             service = self._get_service()
             query = args["query"]
+            tokens = [t for t in query.lower().split() if t]
+            if not tokens:
+                return {"success": True, "messages": [], "count": 0, "query": query,
+                        "space": args.get("space")}
             limit = args.get("limit", 25)
-            order_by = args.get("order_by", "relevance")
             space = args.get("space")
-            
-            # Build search parameters
-            search_params = {
-                "pageSize": min(limit, 100),
-                "orderBy": order_by
-            }
-            
-            # If space is specified, search within that space only
+
+            all_matches: List[Dict[str, Any]] = []
+            total_scanned = 0
+
             if space:
-                # Search messages within specific space
-                result = service.spaces().messages().list(
-                    parent=space,
-                    pageSize=min(limit, 100),
-                    orderBy=order_by if order_by != "relevance" else "create_time desc",
-                    filter=f'text:"{query}"'
-                ).execute()
-                
-                messages = result.get("messages", [])
-                # Filter messages that contain the query text (basic text search)
-                filtered_messages = [
-                    msg for msg in messages 
-                    if query.lower() in msg.get("text", "").lower()
-                ][:limit]
-                
+                spaces = [{"name": space}]
             else:
-                # Search across all accessible spaces
-                # Note: Google Chat API has limited search capabilities
-                # This implements a basic approach by searching recent messages
-                spaces_result = service.spaces().list(pageSize=50).execute()
-                spaces = spaces_result.get("spaces", [])
-                
-                all_messages = []
-                for space_info in spaces:
-                    try:
-                        messages_result = service.spaces().messages().list(
-                            parent=space_info["name"],
-                            pageSize=20,
-                            orderBy="create_time desc"
-                        ).execute()
-                        
-                        space_messages = messages_result.get("messages", [])
-                        # Add space info to each message
-                        for msg in space_messages:
-                            msg["_space_info"] = space_info
-                        
-                        all_messages.extend(space_messages)
-                    except HttpError:
-                        # Skip spaces we can't access
-                        continue
-                
-                # Filter messages that contain the query text
-                filtered_messages = [
-                    msg for msg in all_messages 
-                    if query.lower() in msg.get("text", "").lower()
-                ][:limit]
-            
-            logger.info(f"Found {len(filtered_messages)} messages matching '{query}'")
+                spaces = self._list_all_spaces(service)
+
+            for space_info in spaces:
+                if total_scanned >= self._MAX_MESSAGES_SCANNED:
+                    break
+                if len(all_matches) >= limit:
+                    break
+                budget = self._MAX_MESSAGES_SCANNED - total_scanned
+                try:
+                    matches, scanned = self._scan_space_messages(
+                        service, space_info["name"], tokens,
+                        limit - len(all_matches), budget,
+                    )
+                except HttpError:
+                    continue  # skip spaces we can't read
+                total_scanned += scanned
+                for msg in matches:
+                    msg["_space_info"] = space_info
+                all_matches.extend(matches)
+
+            logger.info(
+                f"search_messages '{query}': {len(all_matches)} matches "
+                f"({total_scanned} messages scanned across {len(spaces)} spaces)"
+            )
             return {
                 "success": True,
-                "messages": filtered_messages,
-                "count": len(filtered_messages),
+                "messages": all_matches[:limit],
+                "count": len(all_matches[:limit]),
                 "query": query,
-                "space": space
+                "space": space,
+                "messages_scanned": total_scanned,
+                "truncated": total_scanned >= self._MAX_MESSAGES_SCANNED,
             }
-            
+
         except HttpError as e:
             return self._handle_api_error(e, "search_messages")
         except Exception as e:
@@ -248,17 +284,22 @@ class SearchTools(BaseTool):
             space_type = args.get("space_type")
             limit = args.get("limit", 25)
             
-            # Get all accessible spaces
-            filter_params = {}
-            if space_type:
-                filter_params["filter"] = f"spaceType={space_type}"
-            
-            result = service.spaces().list(
-                pageSize=100,
-                **filter_params
-            ).execute()
-            
-            spaces = result.get("spaces", [])
+            # Get all accessible spaces (page through every result)
+            spaces = []
+            page_token = None
+            while True:
+                filter_params = {}
+                if space_type:
+                    filter_params["filter"] = f'space_type = "{space_type}"'
+                result = service.spaces().list(
+                    pageSize=100,
+                    pageToken=page_token,
+                    **filter_params
+                ).execute()
+                spaces.extend(result.get("spaces", []))
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
             
             # Filter spaces that match the query
             filtered_spaces = []
